@@ -1,0 +1,14 @@
+[package]
+name = "xcl-header-export"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-only"
+publish = false
+
+[dependencies]
+xcl = { path = "../../xcl/crates/xcl" }
+windows = { version = "0.62", features = ["Win32_Graphics_Direct3D12"] }
+
+[lib]
+name = "bridge_root"
+crate-type = ["cdylib"]
