@@ -1,0 +1,900 @@
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index 6672c1ed11aff6ac62e645198663553fad659699..f9042a88c993645ef0e929558a151afc6ba2fd98 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -181,7 +181,12 @@ fn create() -> windows::core::Result<Host> {
+             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+             tracing::info!("host device on the software adapter (WARP)");
+         } else {
+-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
++            let level = D3D_FEATURE_LEVEL_12_0;
++            #[cfg(test)]
++            let level = if std::env::var_os("XCL_VICTORY_LOW_FL").is_some() {
++                windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0
++            } else {level};
++            D3D12CreateDevice(None, level, &mut device)?;
+         }
+         let device = device.ok_or_else(windows::core::Error::empty)?;
+         let messages = debug
+@@ -2053,3 +2058,11 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at
+         );
+     }
+ }
++
++#[cfg(test)]
++mod xcl_header_test;
++
++#[cfg(test)]
++mod constructor_layout;
++#[cfg(test)]
++mod constructor_bridge;
+diff --git a/crates/victory-gpu/src/host/constructor_bridge.rs b/crates/victory-gpu/src/host/constructor_bridge.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..94f940e0c6a20657ce5cb6948a7280f5e9bdb72e
+--- /dev/null
++++ b/crates/victory-gpu/src/host/constructor_bridge.rs
+@@ -0,0 +1,131 @@
++//! An ordered gather and scatter adapter for the standalone ConstructBVH4
++//! fixture. All eight root spans must already name proven backing.
++use super::constructor_layout::{self as layout, Binding, Need, ROOTS, TABLE_BYTES};
++use super::*;
++
++pub(super) struct Owner<'a> {
++    pub resource: &'a ID3D12Resource,
++    pub entry: D3D12_RESOURCE_STATES,
++}
++pub(super) struct Arena {
++    pub plan: layout::Layout,
++    pub data: *const u8,
++}
++
++fn state(
++    list: &HostList,
++    buffer: &ID3D12Resource,
++    from: D3D12_RESOURCE_STATES,
++    to: D3D12_RESOURCE_STATES,
++) {
++    if from != to {
++        unsafe {
++            list.list.ResourceBarrier(&[transition(buffer, from, to)]);
++        }
++    }
++}
++
++pub(super) fn record(
++    host: &Host,
++    list: &HostList,
++    root: &ID3D12RootSignature,
++    pso: &ID3D12PipelineState,
++    table: &[u8; TABLE_BYTES],
++    bindings: &[Option<Binding>; ROOTS],
++    needs: &[Need; ROOTS],
++    owners: &[Owner],
++    io: &ID3D12Resource,
++    result_regs: &ID3D12Resource,
++    unused_win: &ID3D12Resource,
++) -> Result<Arena, &'static str> {
++    let mut ids = std::collections::BTreeSet::new();
++    let widths: Vec<_> = owners
++        .iter()
++        .map(|o| {
++            if !ids.insert(o.resource.as_raw() as usize) {
++                return Err("duplicate resource identity");
++            }
++            let desc = unsafe { o.resource.GetDesc() };
++            if desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER {
++                return Err("owner is not a buffer");
++            }
++            Ok(desc.Width)
++        })
++        .collect::<Result<_, _>>()?;
++    let plan = layout::make(table, bindings, needs, &widths)?;
++    // Every validation and allocation completes before recording commands.
++    let (arena, p) = host
++        .shared_buffer(plan.arena_bytes)
++        .ok_or("cannot allocate packed window")?;
++    let (arg_upload, up) = host
++        .upload_buffer(TABLE_BYTES as u64)
++        .ok_or("cannot allocate root argument upload")?;
++    unsafe {
++        p.write_bytes(0xa5, plan.arena_bytes as usize);
++        std::ptr::copy_nonoverlapping(plan.table.as_ptr(), up, TABLE_BYTES);
++    }
++    for b in [&arena, &arg_upload, io, result_regs, unused_win] {
++        list.keep(b);
++    }
++    list.keep(root);
++    list.keep(pso);
++    let read: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_COPY_SOURCE;
++    let write = D3D12_RESOURCE_STATE_COPY_DEST;
++    let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
++    let common = D3D12_RESOURCE_STATE_COMMON;
++    let used: std::collections::BTreeSet<_> = plan.gather.iter().map(|c| c.owner).collect();
++    let modified: std::collections::BTreeSet<_> = plan.scatter.iter().map(|c| c.owner).collect();
++    for &i in &used {
++        list.keep(owners[i].resource);
++        state(list, owners[i].resource, owners[i].entry, read);
++    }
++    state(list, &arena, common, write);
++    unsafe {
++        list.list
++            .CopyBufferRegion(&arena, 0, &arg_upload, 0, TABLE_BYTES as u64);
++        for c in &plan.gather {
++            list.list.CopyBufferRegion(
++                &arena,
++                c.arena,
++                owners[c.owner].resource,
++                c.offset,
++                c.bytes,
++            );
++        }
++    }
++    state(list, &arena, write, uav);
++    unsafe {
++        list.list.SetComputeRootSignature(root);
++        list.list.SetPipelineState(pso);
++        for (k, r) in [io, result_regs, &arena, unused_win, unused_win, unused_win]
++            .iter()
++            .enumerate()
++        {
++            list.list
++                .SetComputeRootUnorderedAccessView(k as u32, r.GetGPUVirtualAddress());
++        }
++        list.list.Dispatch(1, 1, 1);
++    }
++    // Transition from UAV both orders previous writes and permits the actual GPU copy.
++    state(list, &arena, uav, read);
++    for &i in &modified {
++        state(list, owners[i].resource, read, write);
++    }
++    unsafe {
++        for c in &plan.scatter {
++            list.list.CopyBufferRegion(
++                owners[c.owner].resource,
++                c.offset,
++                &arena,
++                c.arena,
++                c.bytes,
++            );
++        }
++    }
++    for &i in &used {
++        let from = if modified.contains(&i) { write } else { read };
++        state(list, owners[i].resource, from, owners[i].entry);
++    }
++    state(list, &arena, read, common);
++    Ok(Arena { plan, data: p })
++}
+diff --git a/crates/victory-gpu/src/host/constructor_bridge_test.rs b/crates/victory-gpu/src/host/constructor_bridge_test.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..293439bc382e1c1df014ade55c1f5cc8863b4248
+--- /dev/null
++++ b/crates/victory-gpu/src/host/constructor_bridge_test.rs
+@@ -0,0 +1,252 @@
++use super::*;
++use crate::host::constructor_bridge::{Owner, record};
++use crate::host::constructor_layout::{Binding, Need, TABLE_BYTES};
++
++// Seven actual allocations for eight root addresses: root 4 is a bounded
++// subspan of root 0. Synthetic guest VAs deliberately are not host GPU VAs.
++const OWNER_ID: [usize; 8] = [0, 1, 2, 3, 0, 4, 5, 6];
++const BASES: [u64; 7] = [
++    0x190001000,
++    0x200006000,
++    0x780001000,
++    0x1400002000,
++    0x1a40002000,
++    0x970009000,
++    0x480004000,
++];
++const PREFIX_WORDS: [usize; 7] = [13, 21, 19, 9, 37, 17, 29];
++const SUFFIX_WORDS: usize = 21;
++
++pub(super) fn verify(host: &Host, root: &ID3D12RootSignature, split: bool) {
++    let pso = create_pipeline(
++        host,
++        root,
++        &format!("Z:\\fixture\\constructor\\windows4-split{split}.dxil"),
++    );
++    for (count, initial) in [(2usize, 0usize), (1, 1), (2, 2), (3, 3)] {
++        let name = format!("instances-{count}-initial-{initial}");
++        let file = format!("Z:\\fixture\\constructor\\cases\\{name}");
++        let source = fixture_words(&format!("{file}.input"));
++        let expected = fixture_words(&format!("{file}.expected"));
++        let leaf_base = (count - 1).max(1);
++        let nodes = leaf_base + count;
++        let bytes = [
++            128 + 128 * count + 128 * leaf_base,
++            4 * nodes,
++            4 * nodes,
++            8 * nodes,
++            64,
++            4,
++            24 * nodes,
++            4 * count,
++        ];
++        let mut table = [0u8; TABLE_BYTES];
++        for (i, v) in source[..20].iter().enumerate() {
++            table[4 * i..4 * i + 4].copy_from_slice(&v.to_le_bytes());
++        }
++        let original: [usize; 8] = std::array::from_fn(|i| {
++            u64::from_le_bytes(table[i * 8..i * 8 + 8].try_into().unwrap()) as usize
++        });
++        assert_eq!(original[4] - original[0], 64);
++        let mut buffers = Vec::new();
++        let mut expect_owners = Vec::new();
++        let mut proofs = [None; 8];
++        let needs = std::array::from_fn(|i| Need {
++            bytes: bytes[i] as u64,
++            writable: i != 7,
++        });
++        for i in 0..8 {
++            let owner = OWNER_ID[i];
++            let base = BASES[owner];
++            let guest = base + if i == 4 { 64 } else { 0 };
++            table[i * 8..i * 8 + 8].copy_from_slice(&guest.to_le_bytes());
++            let offset = PREFIX_WORDS[owner] * 4;
++            let available = if i == 4 { bytes[0] } else { bytes[i] };
++            proofs[i] = Some(Binding {
++                owner,
++                guest_base: base,
++                owner_offset: offset as u64,
++                available: available as u64,
++            });
++            if i == 4 {
++                continue;
++            }
++            assert_eq!(owner, buffers.len());
++            let mut contents = vec![SENTINEL; PREFIX_WORDS[owner] + bytes[i] / 4 + SUFFIX_WORDS];
++            let segment = PREFIX_WORDS[owner]..PREFIX_WORDS[owner] + bytes[i] / 4;
++            let orig = original[i] / 4..(original[i] + bytes[i]) / 4;
++            contents[segment.clone()].copy_from_slice(&source[orig.clone()]);
++            let mut want = contents.clone();
++            want[segment].copy_from_slice(&expected[orig]);
++            // The preceding GPU command supplies the true element count.
++            if i == 0 {
++                contents[PREFIX_WORDS[0] + 3] = if initial == 0 { 1 } else { 0 };
++            }
++            buffers.push(Shared::new(host, &contents));
++            expect_owners.push(want);
++        }
++        let mut sgprs = [0; 128];
++        sgprs[0] = 0;
++        sgprs[1] = 0;
++        sgprs[112] = 0;
++        let io = Shared::new(host, &sgprs);
++        let result_regs = Shared::new(host, &[0; 128]);
++        let unused_win = Shared::new(host, &[SENTINEL; 256]);
++        let output_bytes = bytes[0];
++        let (after, read) = host.shared_buffer(output_bytes as u64).unwrap();
++        let (patch, p) = host.upload_buffer(4).unwrap();
++        unsafe {
++            p.cast::<u32>().write(source[original[0] / 4 + 3]);
++        }
++        let owners: Vec<_> = buffers
++            .iter()
++            .enumerate()
++            .map(|(i, b)| Owner {
++                resource: &b.resource,
++                entry: if i == 0 {
++                    D3D12_RESOURCE_STATE_COPY_DEST
++                } else {
++                    D3D12_RESOURCE_STATE_COMMON
++                },
++            })
++            .collect();
++        let list = host.new_list().unwrap();
++        unsafe {
++            list.list.ResourceBarrier(&[transition(
++                &buffers[0].resource,
++                D3D12_RESOURCE_STATE_COMMON,
++                D3D12_RESOURCE_STATE_COPY_DEST,
++            )]);
++            list.list.CopyBufferRegion(
++                &buffers[0].resource,
++                (PREFIX_WORDS[0] * 4 + 12) as u64,
++                &patch,
++                0,
++                4,
++            );
++        }
++        // Verify invalid requests emit no commands and leave the list usable.
++        let mut missing = proofs;
++        missing[6] = None;
++        assert!(
++            record(
++                host,
++                &list,
++                root,
++                &pso,
++                &table,
++                &missing,
++                &needs,
++                &owners,
++                &io.resource,
++                &result_regs.resource,
++                &unused_win.resource
++            )
++            .is_err()
++        );
++        let mut small = proofs;
++        small[4].as_mut().unwrap().available = 68;
++        assert!(
++            record(
++                host,
++                &list,
++                root,
++                &pso,
++                &table,
++                &small,
++                &needs,
++                &owners,
++                &io.resource,
++                &result_regs.resource,
++                &unused_win.resource
++            )
++            .is_err()
++        );
++        let packed = record(
++            host,
++            &list,
++            root,
++            &pso,
++            &table,
++            &proofs,
++            &needs,
++            &owners,
++            &io.resource,
++            &result_regs.resource,
++            &unused_win.resource,
++        )
++        .unwrap();
++        assert_eq!(packed.plan.gather.len(), 7);
++        assert_eq!(packed.plan.scatter.len(), 6);
++        assert_eq!(packed.plan.table[64..], table[64..]);
++        unsafe {
++            list.list.ResourceBarrier(&[
++                transition(
++                    &buffers[0].resource,
++                    D3D12_RESOURCE_STATE_COPY_DEST,
++                    D3D12_RESOURCE_STATE_COPY_SOURCE,
++                ),
++                transition(
++                    &after,
++                    D3D12_RESOURCE_STATE_COMMON,
++                    D3D12_RESOURCE_STATE_COPY_DEST,
++                ),
++            ]);
++            list.list.CopyBufferRegion(
++                &after,
++                0,
++                &buffers[0].resource,
++                (PREFIX_WORDS[0] * 4) as u64,
++                output_bytes as u64,
++            );
++            list.list.ResourceBarrier(&[
++                transition(
++                    &after,
++                    D3D12_RESOURCE_STATE_COPY_DEST,
++                    D3D12_RESOURCE_STATE_COMMON,
++                ),
++                transition(
++                    &buffers[0].resource,
++                    D3D12_RESOURCE_STATE_COPY_SOURCE,
++                    D3D12_RESOURCE_STATE_COMMON,
++                ),
++            ]);
++        }
++        list.close();
++        host.execute(&[&list]);
++        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
++        for (i, (buf, want)) in buffers.iter().zip(&expect_owners).enumerate() {
++            if let Some(k) = buf.read().iter().zip(want).position(|(a, b)| a != b) {
++                panic!(
++                    "{name}: backing {i} at byte {:#x} got {:#x}, expected {:#x}",
++                    k * 4,
++                    buf.read()[k],
++                    want[k]
++                );
++            }
++        }
++        assert_eq!(
++            unsafe { std::slice::from_raw_parts(read.cast::<u32>(), output_bytes / 4) },
++            &expect_owners[0][PREFIX_WORDS[0]..PREFIX_WORDS[0] + output_bytes / 4]
++        );
++        assert!(unused_win.read().iter().all(|&v| v == SENTINEL));
++        // Every unallocated byte in the packed window is a guard, including
++        // the area around the argument table.
++        let arena =
++            unsafe { std::slice::from_raw_parts(packed.data, packed.plan.arena_bytes as usize) };
++        assert_eq!(&arena[..TABLE_BYTES], &packed.plan.table);
++        for (at, &value) in arena.iter().enumerate().skip(TABLE_BYTES) {
++            if !packed
++                .plan
++                .gather
++                .iter()
++                .any(|x| (x.arena..x.arena + x.bytes).contains(&(at as u64)))
++            {
++                assert_eq!(value, 0xa5, "arena guard {at:#x}");
++            }
++        }
++        println!(
++            "{name}: eight roots on seven resource subspans, six scatter spans, earlier count write and later result copy matched, original constants and every owner/arena guard preserved"
++        );
++    }
++}
+diff --git a/crates/victory-gpu/src/host/constructor_layout.rs b/crates/victory-gpu/src/host/constructor_layout.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..c3373d5dc10584ea1485666415380ff748b32d6a
+--- /dev/null
++++ b/crates/victory-gpu/src/host/constructor_layout.rs
+@@ -0,0 +1,181 @@
++//! Validate all eight typed root-buffer witnesses before building a compact
++//! window for this constructor command. The following 16 argument bytes are
++//! the original root constants. Only the eight pointer fields are relocated.
++pub(super) const ROOTS: usize = 8;
++pub(super) const TABLE_BYTES: usize = 80;
++
++#[derive(Clone, Copy, Debug)]
++pub(super) struct Binding {
++    pub owner: usize,
++    pub guest_base: u64,
++    pub owner_offset: u64,
++    pub available: u64,
++}
++#[derive(Clone, Copy, Debug)]
++pub(super) struct Need {
++    pub bytes: u64,
++    pub writable: bool,
++}
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(super) struct Transfer {
++    pub owner: usize,
++    pub offset: u64,
++    pub arena: u64,
++    pub bytes: u64,
++}
++
++pub(super) struct Layout {
++    pub table: [u8; TABLE_BYTES],
++    pub gather: Vec<Transfer>,
++    pub scatter: Vec<Transfer>,
++    pub arena_bytes: u64,
++}
++
++#[derive(Clone, Copy)]
++struct Range {
++    owner: usize,
++    guest: u64,
++    offset: u64,
++    bytes: u64,
++    writable: bool,
++}
++
++fn overlap(a: u64, end_a: u64, b: u64, end_b: u64) -> bool {
++    a < end_b && b < end_a
++}
++fn combine(inputs: &mut Vec<Transfer>) {
++    inputs.sort_unstable_by_key(|r| (r.owner, r.offset));
++    let mut joined: Vec<Transfer> = Vec::new();
++    for r in inputs.iter().copied() {
++        if let Some(last) = joined.last_mut()
++            && last.owner == r.owner
++            && r.offset <= last.offset + last.bytes
++        {
++            last.bytes = (last.offset + last.bytes).max(r.offset + r.bytes) - last.offset;
++        } else {
++            joined.push(r);
++        }
++    }
++    *inputs = joined;
++}
++
++pub(super) fn make(
++    table: &[u8; TABLE_BYTES],
++    bindings: &[Option<Binding>; ROOTS],
++    needs: &[Need; ROOTS],
++    owner_widths: &[u64],
++) -> Result<Layout, &'static str> {
++    let mut roots = Vec::with_capacity(ROOTS);
++    for (i, (proof, need)) in bindings.iter().zip(needs).enumerate() {
++        let b = proof.ok_or("missing root ownership")?;
++        let width = *owner_widths
++            .get(b.owner)
++            .ok_or("missing backing resource")?;
++        let guest = u64::from_le_bytes(table[i * 8..i * 8 + 8].try_into().unwrap());
++        if guest == 0
++            || guest % 4 != 0
++            || b.owner_offset % 4 != 0
++            || need.bytes == 0
++            || need.bytes % 4 != 0
++        {
++            return Err("empty or unaligned root interval");
++        }
++        let guest_end = b
++            .guest_base
++            .checked_add(b.available)
++            .ok_or("guest interval overflow")?;
++        let root_end = guest
++            .checked_add(need.bytes)
++            .ok_or("root interval overflow")?;
++        if guest < b.guest_base || root_end > guest_end {
++            return Err("root exceeds its proven interval");
++        }
++        if b.owner_offset
++            .checked_add(b.available)
++            .is_none_or(|end| end > width)
++        {
++            return Err("backing interval exceeds resource");
++        }
++        let offset = b.owner_offset + (guest - b.guest_base);
++        if offset % 4 != 0 {
++            return Err("unaligned host offset");
++        }
++        roots.push(Range {
++            owner: b.owner,
++            guest,
++            offset,
++            bytes: need.bytes,
++            writable: need.writable,
++        });
++    }
++    for (i, a) in roots.iter().enumerate() {
++        for b in &roots[..i] {
++            let guest_overlap = overlap(a.guest, a.guest + a.bytes, b.guest, b.guest + b.bytes);
++            let same_owner = a.owner == b.owner;
++            let host_overlap =
++                same_owner && overlap(a.offset, a.offset + a.bytes, b.offset, b.offset + b.bytes);
++            let same_translation = same_owner
++                && i128::from(a.guest) - i128::from(a.offset)
++                    == i128::from(b.guest) - i128::from(b.offset);
++            if (guest_overlap || host_overlap) && !same_translation {
++                return Err("inconsistent alias mapping");
++            }
++        }
++    }
++    let mut gather: Vec<_> = roots
++        .iter()
++        .map(|r| Transfer {
++            owner: r.owner,
++            offset: r.offset,
++            arena: 0,
++            bytes: r.bytes,
++        })
++        .collect();
++    combine(&mut gather);
++    let mut cursor = 256u64; // root table and an untouched guard come first.
++    for c in &mut gather {
++        c.arena = cursor
++            .checked_next_multiple_of(256)
++            .ok_or("arena alignment overflow")?;
++        cursor = c
++            .arena
++            .checked_add(c.bytes)
++            .and_then(|x| x.checked_add(64))
++            .ok_or("arena length overflow")?;
++        if cursor > u32::MAX as u64 {
++            return Err("arena is outside the single 32-bit window");
++        }
++    }
++    let packed = |r: &Range| {
++        gather
++            .iter()
++            .find(|c| {
++                c.owner == r.owner
++                    && r.offset >= c.offset
++                    && r.offset + r.bytes <= c.offset + c.bytes
++            })
++            .map(|c| c.arena + (r.offset - c.offset))
++            .ok_or("unmapped packed range")
++    };
++    let mut table = *table;
++    let mut scatter = Vec::new();
++    for (i, r) in roots.iter().enumerate() {
++        let arena = packed(r)?;
++        table[i * 8..i * 8 + 8].copy_from_slice(&arena.to_le_bytes());
++        if r.writable {
++            scatter.push(Transfer {
++                owner: r.owner,
++                offset: r.offset,
++                arena,
++                bytes: r.bytes,
++            });
++        }
++    }
++    combine(&mut scatter); // all overlapping/adjacent writes are inside the same gather chunk.
++    Ok(Layout {
++        table,
++        gather,
++        scatter,
++        arena_bytes: cursor,
++    })
++}
+diff --git a/crates/victory-gpu/src/host/xcl_header_test.rs b/crates/victory-gpu/src/host/xcl_header_test.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..30863b885e0c36286b16b6290225cce300a6c55e
+--- /dev/null
++++ b/crates/victory-gpu/src/host/xcl_header_test.rs
+@@ -0,0 +1,282 @@
++//! XCL's compiled shader and unmodified root-signature factory, run through
++//! VIctory's host device, shared buffers, command list, queue and fence.
++use super::*;
++use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
++use windows::core::s;
++
++const HIGH: u32 = 0x7f7fffff;
++const LOW: u32 = 0xff7fffff;
++const SENTINEL: u32 = 0xa5a5a5a5;
++const BASE_HIGH: u32 = 0x10;
++
++struct Shared {
++    resource: ID3D12Resource,
++    mapped: *mut u8,
++    words: usize,
++}
++impl Shared {
++    fn new(host: &Host, initial: &[u32]) -> Self {
++        let bytes = size_of_val(initial);
++        let (resource, mapped) = host
++            .shared_buffer(bytes as u64)
++            .expect("VIctory shared buffer");
++        unsafe { std::ptr::copy_nonoverlapping(initial.as_ptr().cast::<u8>(), mapped, bytes) };
++        Self {
++            resource,
++            mapped,
++            words: initial.len(),
++        }
++    }
++    fn read(&self) -> &[u32] {
++        unsafe { std::slice::from_raw_parts(self.mapped.cast(), self.words) }
++    }
++}
++
++fn address(win: usize, offset: usize) -> u64 {
++    ((BASE_HIGH as u64 + win as u64) << 32) | offset as u64
++}
++fn xcl_signature(device: &ID3D12Device) -> ID3D12RootSignature {
++    type Make = unsafe extern "system" fn(*mut std::ffi::c_void, *mut *mut std::ffi::c_void) -> i32;
++    unsafe {
++        let dll = LoadLibraryW(w!("Z:\\probe\\bridge_root.dll")).expect("XCL root factory DLL");
++        let make: Make = std::mem::transmute(
++            GetProcAddress(dll, s!("xcl_compute_root")).expect("XCL root factory"),
++        );
++        let mut raw = std::ptr::null_mut();
++        assert_eq!(
++            make(device.as_raw(), &mut raw),
++            0,
++            "XCL compute root signature"
++        );
++        ID3D12RootSignature::from_raw(raw)
++    }
++}
++fn create_pipeline(host: &Host, root: &ID3D12RootSignature, file: &str) -> ID3D12PipelineState {
++    let shader = std::fs::read(&file).unwrap();
++    eprintln!("creating pipeline {file}");
++    let state: ID3D12PipelineState = unsafe {
++        host.device
++            .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
++                pRootSignature: std::mem::transmute_copy(root),
++                CS: D3D12_SHADER_BYTECODE {
++                    pShaderBytecode: shader.as_ptr().cast(),
++                    BytecodeLength: shader.len(),
++                },
++                ..Default::default()
++            })
++    }
++    .unwrap_or_else(|e| panic!("XCL compute pipeline {file}: {e}"));
++    eprintln!("pipeline created");
++    state
++}
++fn dispatch(
++    host: &Host,
++    root: &ID3D12RootSignature,
++    state: &ID3D12PipelineState,
++    mem: &[Vec<u32>],
++    sgprs: &[u32; 128],
++) -> Vec<Shared> {
++    let io = Shared::new(host, sgprs);
++    let res = Shared::new(host, &[0; 128]);
++    let wins: Vec<_> = mem.iter().map(|m| Shared::new(host, m)).collect();
++    eprintln!("buffers initialized");
++    let list = host.new_list().unwrap();
++    unsafe {
++        list.list.SetComputeRootSignature(root);
++        list.list.SetPipelineState(state);
++        for (k, b) in [&io, &res, &wins[0], &wins[1], &wins[2], &wins[3]]
++            .into_iter()
++            .enumerate()
++        {
++            list.list
++                .SetComputeRootUnorderedAccessView(k as u32, b.resource.GetGPUVirtualAddress());
++        }
++        list.list.Dispatch(1, 1, 1);
++    }
++    list.close();
++    eprintln!("executing closed list");
++    host.execute(&[&list]);
++    assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
++    wins
++}
++fn run(host: &Host, root: &ID3D12RootSignature, windows: usize, split: bool) {
++    let file = format!("Z:\\fixture\\windows{windows}-split{split}.dxil");
++    let state = create_pipeline(host, root, &file);
++    let mut mem = vec![vec![SENTINEL; 1024]; 4];
++    let (rw, h0, h1) = if windows == 1 { (0, 0, 0) } else { (2, 1, 3) };
++    let (spill, records, dst0, dst1, bounds) = (64usize, 256usize, 768usize, 1280usize, 1792usize);
++    let r = address(rw, records);
++    mem[0][spill / 4..spill / 4 + 2].copy_from_slice(&[r as u32, (r >> 32) as u32]);
++    mem[0][spill / 4 + 4] = 2;
++    for (i, (w, o, b)) in [(h0, dst0, address(0, bounds)), (h1, dst1, 0)]
++        .into_iter()
++        .enumerate()
++    {
++        let d = address(w, o);
++        let n = 0x200 + i as u32 * 10;
++        let lane = [
++            d as u32,
++            (d >> 32) as u32,
++            b as u32,
++            (b >> 32) as u32,
++            n,
++            n + 1,
++            n + 2,
++            n + 3,
++            n + 4,
++            n + 5,
++        ];
++        let k = records / 4 + i * 10;
++        mem[rw][k..k + 10].copy_from_slice(&lane);
++    }
++    let mut expected = mem.clone();
++    for (i, (w, o)) in [(h0, dst0), (h1, dst1)].into_iter().enumerate() {
++        let n = 0x200 + i as u32 * 10;
++        expected[w][o / 4..o / 4 + 16].copy_from_slice(&[
++            n,
++            0,
++            n + 1,
++            n + 2,
++            HIGH,
++            HIGH,
++            HIGH,
++            LOW,
++            LOW,
++            LOW,
++            0,
++            n + 3,
++            u32::MAX,
++            n + 4,
++            n + 5,
++            0x007f7f7f,
++        ]);
++    }
++    expected[0][bounds / 4..bounds / 4 + 6].copy_from_slice(&[HIGH, HIGH, HIGH, LOW, LOW, LOW]);
++    let mut sgprs = [0u32; 128];
++    sgprs[0] = spill as u32;
++    sgprs[1] = BASE_HIGH;
++    sgprs[112] = BASE_HIGH;
++    let wins = dispatch(host, root, &state, &mem, &sgprs);
++    for (win, (actual, want)) in wins.iter().zip(&expected).enumerate() {
++        if let Some(k) = actual.read().iter().zip(want).position(|(a, b)| a != b) {
++            panic!(
++                "windows={windows} split={split}, window {win} byte {:#x}: got {:08x}, expected {:08x}",
++                k * 4,
++                actual.read()[k],
++                want[k]
++            );
++        }
++    }
++    println!(
++        "windows={windows} split={split}: two 64-byte headers, optional 24-byte bounds and every sentinel byte in all four 4096-byte allocations matched"
++    );
++}
++
++fn fixture_words(path: &str) -> Vec<u32> {
++    let bytes = std::fs::read(path).unwrap();
++    assert_eq!(bytes.len(), 16384);
++    bytes
++        .chunks_exact(4)
++        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
++        .collect()
++}
++
++fn construct(host: &Host, root: &ID3D12RootSignature, split: bool) {
++    let file = format!("Z:\\fixture\\constructor\\windows4-split{split}.dxil");
++    let state = create_pipeline(host, root, &file);
++    let mut failures = 0;
++    // The independent SPIR-V reference uses relative addresses entirely
++    // within window zero, with the root argument table beginning at zero.
++    // Register same synthetic base in the runtime shader for comparison.
++    let sgprs = [0; 128];
++    for case in [
++        "instances-2-initial-0",
++        "instances-1-initial-1",
++        "instances-2-initial-2",
++        "instances-3-initial-3",
++    ] {
++        let base = format!("Z:\\fixture\\constructor\\cases\\{case}");
++        let input = fixture_words(&format!("{base}.input"));
++        let expected = fixture_words(&format!("{base}.expected"));
++        let mem = vec![
++            input,
++            vec![SENTINEL; 4096],
++            vec![SENTINEL; 4096],
++            vec![SENTINEL; 4096],
++        ];
++        let actual = dispatch(host, root, &state, &mem, &sgprs);
++        let mismatches: Vec<_> = actual[0]
++            .read()
++            .iter()
++            .zip(&expected)
++            .enumerate()
++            .filter(|(_, (a, b))| a != b)
++            .collect();
++        let first: Vec<_> = mismatches
++            .iter()
++            .take(12)
++            .map(|(i, (a, b))| format!("{:#x}={:08x}/{:08x}", i * 4, a, b))
++            .collect();
++        println!(
++            "ConstructBVH4 {case}: {} differing dwords of 4096, first actual/expected {first:?}",
++            mismatches.len()
++        );
++        failures += mismatches.len();
++        for b in &actual[1..] {
++            assert!(b.read().iter().all(|&v| v == SENTINEL));
++        }
++    }
++    assert_eq!(
++        failures, 0,
++        "XCL constructor result compared with original shader on software Vulkan"
++    );
++}
++#[path = "constructor_bridge_test.rs"]
++mod constructor_bridge_test;
++
++#[test]
++fn public_xcl_headers_on_victory_host() {
++    if std::env::var_os("XCL_VICTORY_BRIDGE").is_none() {
++        return;
++    }
++    let h = host().expect("VIctory software host");
++    let mut wave = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
++    unsafe {
++        h.device.CheckFeatureSupport(
++            D3D12_FEATURE_D3D12_OPTIONS1,
++            (&raw mut wave).cast(),
++            size_of_val(&wave) as u32,
++        )
++    }
++    .unwrap();
++    let mut model = D3D12_FEATURE_DATA_SHADER_MODEL {
++        HighestShaderModel: D3D_SHADER_MODEL_6_6,
++    };
++    unsafe {
++        h.device.CheckFeatureSupport(
++            D3D12_FEATURE_SHADER_MODEL,
++            (&raw mut model).cast(),
++            size_of_val(&model) as u32,
++        )
++    }
++    .unwrap();
++    eprintln!(
++        "SM {:#x}, wave range {}..{}, wave ops={}",
++        model.HighestShaderModel.0,
++        wave.WaveLaneCountMin,
++        wave.WaveLaneCountMax,
++        wave.WaveOps.as_bool()
++    );
++    assert!(
++        model.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0,
++        "public XCL compute requires shader model 6.6"
++    );
++    eprintln!("requesting XCL root signature");
++    let root = xcl_signature(&h.device);
++    eprintln!("created XCL root signature");
++    for windows in [1, 4] {
++        run(h, &root, windows, wave.WaveLaneCountMax < 64);
++    }
++    construct(h, &root, wave.WaveLaneCountMax < 64);
++    constructor_bridge_test::verify(h, &root, wave.WaveLaneCountMax < 64);
++}
