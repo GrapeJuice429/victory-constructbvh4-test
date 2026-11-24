@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+target/
+*.dll
+*.exe
+*.dxil
+*.input
+*.expected
+*.zip
+*.log
